@@ -2,14 +2,16 @@ import type { OAuthConfig, PersistentSession, ProviderKeys, TokenRequest, TokenR
 import type { H3Event } from 'h3'
 import type { OidcProviderConfig } from '../utils/provider'
 import type { JwtPayload } from '../utils/security'
-import { useRuntimeConfig, useStorage } from '#imports'
+import { useRuntimeConfig } from '#imports'
 import { deleteCookie, eventHandler, getQuery, getRequestURL, readBody, sendRedirect } from 'h3'
+import { useStorage } from 'nitropack/runtime'
 import { normalizeURL, parseURL } from 'ufo'
 import { textToBase64 } from 'undio'
 import * as providerPresets from '../../providers'
 import { validateConfig } from '../utils/config'
 import { configMerger, convertObjectToSnakeCase, convertTokenRequestToType, oidcErrorHandler, useOidcLogger } from '../utils/oidc'
 import { createProviderFetch } from '../utils/provider'
+import { resolveCallbackRedirectUrl } from '../utils/redirect'
 import { encryptToken, parseJwtToken, validateToken } from '../utils/security'
 import { getUserSessionId, setUserSession, useAuthSession } from '../utils/session'
 
@@ -17,7 +19,9 @@ function callbackEventHandler({ onSuccess }: OAuthConfig<UserSession>) {
   const logger = useOidcLogger()
   return eventHandler(async (event: H3Event) => {
     const provider = event.path.split('/')[2] as ProviderKeys
-    const config = configMerger(useRuntimeConfig().oidc.providers[provider] as OidcProviderConfig, providerPresets[provider])
+    const runtimeProviderConfig = useRuntimeConfig().oidc.providers[provider] as OidcProviderConfig
+    const config = configMerger(runtimeProviderConfig, providerPresets[provider])
+    const hasConfiguredCallbackRedirectUrl = typeof runtimeProviderConfig?.callbackRedirectUrl === 'string'
 
     // Create custom fetch instance for this provider
     const customFetch = await createProviderFetch(config)
@@ -196,7 +200,11 @@ function callbackEventHandler({ onSuccess }: OAuthConfig<UserSession>) {
     if (config.optionalClaims && tokens.idToken) {
       const parsedIdToken = tokens.idToken
       user.claims = {}
-      config.optionalClaims.forEach(claim => parsedIdToken[claim] && ((user.claims as Record<string, unknown>)[claim] = (parsedIdToken[claim])))
+      config.optionalClaims.forEach((claim) => {
+        if (parsedIdToken[claim]) {
+          (user.claims as Record<string, unknown>)[claim] = parsedIdToken[claim]
+        }
+      })
     }
 
     if (tokenResponse.refresh_token || config.exposeAccessToken || config.exposeIdToken) {
@@ -221,7 +229,11 @@ function callbackEventHandler({ onSuccess }: OAuthConfig<UserSession>) {
     deleteCookie(event, 'oidc')
     return onSuccess(event, {
       user,
-      callbackRedirectUrl: config.callbackRedirectUrl as string,
+      callbackRedirectUrl: resolveCallbackRedirectUrl({
+        configuredCallbackRedirectUrl: config.callbackRedirectUrl,
+        hasConfiguredCallbackRedirectUrl,
+        sessionCallbackRedirectUrl: session.data.callbackRedirectUrl,
+      }),
     })
   })
 }

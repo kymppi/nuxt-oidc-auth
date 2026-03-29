@@ -1,17 +1,25 @@
 import type { AuthSession, AuthSessionConfig, PersistentSession, ProviderKeys, ProviderSessionConfig, UserSession } from '#oidc-auth'
 import type { H3Event, SessionConfig } from 'h3'
 import type { OidcProviderConfig } from './provider'
-import { useRuntimeConfig, useStorage } from '#imports'
+import { useRuntimeConfig } from '#imports'
 import { defu } from 'defu'
-import { createError, deleteCookie, useSession } from 'h3'
+import { createError, deleteCookie, sendRedirect, useSession } from 'h3'
 import { createHooks } from 'hookable'
+import { useStorage } from 'nitropack/runtime'
 import * as providerPresets from '../../providers'
-import { configMerger, oidcErrorHandler, refreshAccessToken, useOidcLogger } from './oidc'
+import { configMerger, refreshAccessToken, useOidcLogger } from './oidc'
 import { decryptToken, encryptToken } from './security'
+import { resolveMissingPersistentSessionMode } from './session-options'
 
 const DEFAULT_SESSION_NAME = 'nuxt-oidc-auth'
 let sessionConfig: Pick<SessionConfig, 'name' | 'password'> & AuthSessionConfig
 const providerSessionConfigs: Record<ProviderKeys, ProviderSessionConfig> = {} as any
+
+export type SessionErrorBehavior = 'throw' | 'redirect'
+
+export interface SessionBehaviorOptions {
+  errorBehavior?: SessionErrorBehavior
+}
 
 export interface SessionHooks {
   /**
@@ -60,7 +68,7 @@ export async function setUserSession(event: H3Event, data: UserSession) {
 export async function clearUserSession(event: H3Event, skipHook: boolean = false) {
   const session = await _useSession(event)
   const sessionId = session.id as string
-  let singleSignOutSessionId
+  let singleSignOutSessionId: string | undefined
   if (session.data.singleSignOut) {
     const persistentSession = await useStorage('oidc').getItem<PersistentSession>(sessionId) as PersistentSession | null
     singleSignOutSessionId = persistentSession?.singleSignOutId
@@ -82,13 +90,26 @@ export async function clearUserSession(event: H3Event, skipHook: boolean = false
   }
 }
 
-export async function refreshUserSession(event: H3Event) {
+async function handleSessionError(event: H3Event, message: string, options: SessionBehaviorOptions = {}): Promise<never> {
+  if (options.errorBehavior === 'redirect') {
+    return await sendRedirect(event, '/', 302) as never
+  }
+
+  throw createError({
+    statusCode: 401,
+    message,
+  })
+}
+
+export async function refreshUserSession(event: H3Event, options: SessionBehaviorOptions = {}) {
   const session = await _useSession(event)
   const provider = session.data.provider as ProviderKeys
   const persistentSession = await useStorage('oidc').getItem<PersistentSession>(session.id as string) as PersistentSession | null
+  const logger = useOidcLogger()
 
   if (!session.data.canRefresh || !persistentSession?.refreshToken) {
-    return oidcErrorHandler(event, `[${provider}] Token refresh failed: No refresh token`)
+    await clearUserSession(event)
+    return await handleSessionError(event, `[${provider}] Token refresh failed: No refresh token`, options)
   }
 
   // Refresh the access token
@@ -97,12 +118,14 @@ export async function refreshUserSession(event: H3Event) {
 
   const config = configMerger(useRuntimeConfig().oidc.providers[provider] as OidcProviderConfig, providerPresets[provider])
 
-  let tokenRefreshResponse
+  let tokenRefreshResponse: Awaited<ReturnType<typeof refreshAccessToken>>
   try {
     tokenRefreshResponse = await refreshAccessToken(refreshToken, config as OidcProviderConfig)
   }
   catch (error) {
-    return oidcErrorHandler(event, `[${provider}] Token refresh failed: ${error}`)
+    logger.error(`[${provider}] Token refresh failed: ${error}`)
+    await clearUserSession(event)
+    return await handleSessionError(event, `[${provider}] Token refresh failed`, options)
   }
 
   const { user, tokens, expiresIn, parsedAccessToken } = tokenRefreshResponse
@@ -133,20 +156,17 @@ export async function refreshUserSession(event: H3Event) {
 }
 
 // Deprecated, please use getUserSession
-export async function requireUserSession(event: H3Event) {
-  return await getUserSession(event)
+export async function requireUserSession(event: H3Event, options: SessionBehaviorOptions = {}) {
+  return await getUserSession(event, options)
 }
 
-export async function getUserSession(event: H3Event) {
+export async function getUserSession(event: H3Event, options: SessionBehaviorOptions = {}) {
   const logger = useOidcLogger()
   const session = await _useSession(event)
   const userSession = session.data
 
   if (Object.keys(userSession).length === 0) {
-    throw createError({
-      statusCode: 401,
-      message: 'Unauthorized',
-    })
+    return await handleSessionError(event, 'Unauthorized', options)
   }
 
   const provider = userSession.provider as ProviderKeys
@@ -158,13 +178,15 @@ export async function getUserSession(event: H3Event) {
     if (userSession.canRefresh) {
       persistentSession = await useStorage('oidc').getItem<PersistentSession>(sessionId as string) as PersistentSession | null
       if (!persistentSession) {
-        logger.warn('Persistent user session not found')
-        if (userSession.singleSignOut) {
+        const missingPersistentSessionMode = resolveMissingPersistentSessionMode(providerSessionConfigs[provider], userSession)
+        if (missingPersistentSessionMode === 'clear') {
+          logger.info('Persistent user session not found, clearing stale session')
           await clearUserSession(event)
-          throw createError({
-            statusCode: 401,
-            message: 'Session not found',
-          })
+          return await handleSessionError(event, 'Session not found', options)
+        }
+
+        if (missingPersistentSessionMode === 'warn') {
+          logger.warn('Persistent user session not found')
         }
       }
     }
@@ -186,15 +208,12 @@ export async function getUserSession(event: H3Event) {
       logger.info('Session expired')
       // Automatic token refresh
       if (providerSessionConfigs[provider].automaticRefresh) {
-        await refreshUserSession(event)
+        return await refreshUserSession(event, options)
       }
       else {
         logger.warn('Session expired, automatic refresh disabled')
         await clearUserSession(event)
-        throw createError({
-          statusCode: 401,
-          message: 'Session expired',
-        })
+        return await handleSessionError(event, 'Session expired', options)
       }
     }
   }
@@ -235,19 +254,21 @@ function resolveSessionName(config: AuthSessionConfig | undefined): string {
 
 function _useSession(event: H3Event) {
   if (!sessionConfig || !Object.keys(providerSessionConfigs).length) {
+    const runtimeConfig = useRuntimeConfig(event).oidc
+    const config = runtimeConfig.session as AuthSessionConfig
+    const missingPersistentSession = config.missingPersistentSession
     // Merge sessionConfig
-    const sessionName = resolveSessionName(useRuntimeConfig(event).oidc.session)
-    sessionConfig = defu({ password: process.env.NUXT_OIDC_SESSION_SECRET!, name: sessionName }, useRuntimeConfig(event).oidc.session)
+    const sessionName = resolveSessionName(config)
+    sessionConfig = defu({ password: process.env.NUXT_OIDC_SESSION_SECRET!, name: sessionName }, config)
     // Merge providerSessionConfigs
-    Object.keys(useRuntimeConfig(event).oidc.providers).map(
-      key => key as ProviderKeys,
-    ).forEach(
-      key => providerSessionConfigs[key] = defu(useRuntimeConfig(event).oidc.providers[key]?.sessionConfiguration, providerPresets[key].sessionConfiguration, {
-        automaticRefresh: useRuntimeConfig(event).oidc.session.automaticRefresh,
-        expirationCheck: useRuntimeConfig(event).oidc.session.expirationCheck,
-        expirationThreshold: useRuntimeConfig(event).oidc.session.expirationThreshold,
-      }) as ProviderSessionConfig,
-    )
+    for (const key of Object.keys(runtimeConfig.providers) as ProviderKeys[]) {
+      providerSessionConfigs[key] = defu(runtimeConfig.providers[key]?.sessionConfiguration, providerPresets[key].sessionConfiguration, {
+        automaticRefresh: config.automaticRefresh,
+        expirationCheck: config.expirationCheck,
+        expirationThreshold: config.expirationThreshold,
+        missingPersistentSession,
+      }) as ProviderSessionConfig
+    }
   }
   return useSession<UserSession>(event, sessionConfig)
 }
